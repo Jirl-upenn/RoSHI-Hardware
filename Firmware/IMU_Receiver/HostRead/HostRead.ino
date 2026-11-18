@@ -10,7 +10,7 @@
 #define OLED_RESET   -1
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-/* ===== IMU packet (40 bytes) ===== */
+/* ===== IMU packet: 42 bytes from the original tracker firmware ===== */
 typedef struct __attribute__((packed)) {
   uint8_t tracker_id;
   float   ax, ay, az;
@@ -19,10 +19,23 @@ typedef struct __attribute__((packed)) {
   uint8_t battery_percent;
 } IMUDataPacket;
 
+/* ===== Diagnostic IMU packet: the same 42 bytes, then the extra state (see IMU_Tracker.ino) ===== */
+typedef struct __attribute__((packed)) {
+  IMUDataPacket base;
+  float   gqI, gqJ, gqK, gqW;
+  float   gx, gy, gz;
+  float   mx, my, mz;
+  uint8_t rv_status;
+  uint8_t mag_status;
+  float   rv_accuracy_rad;
+  uint8_t reset_count;
+} IMUDiagPacket;
+
 /* ===== Button packet (4 bytes) ===== */
 typedef struct __attribute__((packed)) { uint8_t id, batt, b14, b12; } ButtonPacket;
 
 static inline bool looksLikeIMUPacket(int len){ return len == (int)sizeof(IMUDataPacket); }
+static inline bool looksLikeDiagPacket(int len){ return len == (int)sizeof(IMUDiagPacket); }
 static inline bool looksLikeButtonPacket(int len){ return len == (int)sizeof(ButtonPacket); }
 
 /* ===== timing thresholds ===== */
@@ -82,8 +95,31 @@ void drawGrid()
 
 void onReceive(const esp_now_recv_info *, const uint8_t *data, int len)
 {
-  if (looksLikeIMUPacket(len)) {
+  if (looksLikeIMUPacket(len) || looksLikeDiagPacket(len)) {
     IMUDataPacket p; memcpy(&p, data, sizeof(p));
+    if (looksLikeDiagPacket(len)) {
+      /* The original line, then the extra fields: readers that match the old prefix still work.
+         Quaternions get more digits here so that small heading changes are not lost to rounding. */
+      IMUDiagPacket d; memcpy(&d, data, sizeof(d));
+      Serial.printf(
+        "ID:%d | r:%.1f p:%.1f y:%.1f | "
+        "ax:%.2f ay:%.2f az:%.2f | "
+        "qI:%.5f qJ:%.5f qK:%.5f qW:%.5f | "
+        "batt:%u%% | "
+        "gI:%.5f gJ:%.5f gK:%.5f gW:%.5f | "
+        "gx:%.4f gy:%.4f gz:%.4f | "
+        "mx:%.2f my:%.2f mz:%.2f | "
+        "rvs:%u mags:%u rvacc:%.4f rst:%u\n",
+        p.tracker_id,
+        p.roll, p.pitch, p.yaw,
+        p.ax, p.ay, p.az,
+        p.qI,  p.qJ,  p.qK,  p.qW,
+        p.battery_percent,
+        d.gqI, d.gqJ, d.gqK, d.gqW,
+        d.gx, d.gy, d.gz,
+        d.mx, d.my, d.mz,
+        d.rv_status, d.mag_status, d.rv_accuracy_rad, d.reset_count);
+    } else
     Serial.printf(
       "ID:%d | r:%.1f p:%.1f y:%.1f | "
       "ax:%.2f ay:%.2f az:%.2f | "
