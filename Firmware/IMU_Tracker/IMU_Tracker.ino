@@ -54,12 +54,76 @@ void enableReports() {
   imu.enableMagnetometer(REPORT_US);
 }
 
+/* ---- latest sensor state, filled by onSensorEvent ---- */
+static float ax, ay, az, roll, pitch, yaw, qI, qJ, qK, qW;
+static float gqI, gqJ, gqK, gqW = 1.0f, gx, gy, gz, mx, my, mz, rvAcc;
+static uint8_t rvStatus = 0, magStatus = 0;
+static uint8_t got = 0;
+
+/* Roll, pitch and yaw in degrees, with the same formulas the library's getRoll/getPitch/getYaw use. */
+static void quatToEulerDeg(float w, float x, float y, float z, float &r, float &p, float &yw) {
+  float norm = sqrt(w * w + x * x + y * y + z * z);
+  w /= norm; x /= norm; y /= norm; z /= norm;
+  float ysqr = y * y;
+  r = atan2(2.0f * (w * x + y * z), 1.0f - 2.0f * (x * x + ysqr)) * 180.0f / PI;
+  float t2 = constrain(2.0f * (w * y - z * x), -1.0f, 1.0f);
+  p = asin(t2) * 180.0f / PI;
+  yw = atan2(2.0f * (w * z + x * y), 1.0f - 2.0f * (ysqr + z * z)) * 180.0f / PI;
+}
+
+/* Called once per sensor event. One bus read can carry several events (the two rotation vectors
+   arrive together), and imu.getSensorEvent() keeps only the last of them, which dropped every
+   rotation vector once the extra reports were enabled. */
+static void onSensorEvent(void *cookie, sh2_SensorEvent_t *event) {
+  sh2_SensorValue_t v;
+  if (sh2_decodeSensorEvent(&v, event) != SH2_OK) return;
+
+  switch (v.sensorId) {
+    case SH2_ROTATION_VECTOR:
+      qI = v.un.rotationVector.i; qJ = v.un.rotationVector.j;
+      qK = v.un.rotationVector.k; qW = v.un.rotationVector.real;
+      quatToEulerDeg(qW, qI, qJ, qK, roll, pitch, yaw);
+      rvStatus = v.status;
+      rvAcc    = v.un.rotationVector.accuracy;
+      got |= 0b01; break;
+
+    case SH2_GAME_ROTATION_VECTOR:
+      gqI = v.un.gameRotationVector.i; gqJ = v.un.gameRotationVector.j;
+      gqK = v.un.gameRotationVector.k; gqW = v.un.gameRotationVector.real;
+      break;
+
+    case SH2_GYROSCOPE_CALIBRATED:
+      gx = v.un.gyroscope.x; gy = v.un.gyroscope.y; gz = v.un.gyroscope.z;
+      break;
+
+    case SH2_MAGNETIC_FIELD_CALIBRATED:
+      mx = v.un.magneticField.x; my = v.un.magneticField.y; mz = v.un.magneticField.z;
+      magStatus = v.status;
+      break;
+
+    case SH2_ACCELEROMETER:
+      ax = v.un.accelerometer.x; ay = v.un.accelerometer.y; az = v.un.accelerometer.z;
+      got |= 0b10; break;
+  }
+}
+
 /* ---- setup ---- */
 void setup() {
   Serial.begin(BAUDRATE);
   Wire.begin(); Wire.setClock(400000); delay(200);
 
-  if (!imu.begin(BNO_ADDR, Wire)) { Serial.println("IMU fail"); while (1); }
+  /* If the ESP is reset or reflashed while the BNO08x is mid-transfer, the sensor keeps holding SDA low
+     and never answers. Wire.status() clocks the line free, so recover the bus and retry before giving up. */
+  bool imuOk = false;
+  for (uint8_t attempt = 0; attempt < 10 && !imuOk; attempt++) {
+    Wire.status();
+    imuOk = imu.begin(BNO_ADDR, Wire);
+    if (!imuOk) delay(300);
+  }
+  if (!imuOk) { Serial.println("IMU fail"); delay(1000); ESP.restart(); }
+
+  /* Take the sensor events straight from the sensor hub driver (see onSensorEvent). */
+  sh2_setSensorCallback(onSensorEvent, NULL);
   enableReports();
 
   WiFi.mode(WIFI_STA); WiFi.disconnect();
@@ -77,43 +141,7 @@ void loop() {
     if (resets < 255) resets++;
     enableReports();
   }
-  if (!imu.getSensorEvent()) return;
-
-  static float ax, ay, az, roll, pitch, yaw, qI, qJ, qK, qW;
-  static float gqI, gqJ, gqK, gqW = 1.0f, gx, gy, gz, mx, my, mz, rvAcc;
-  static uint8_t rvStatus = 0, magStatus = 0;
-  static uint8_t got = 0;
-
-  switch (imu.getSensorEventID()) {
-    case SENSOR_REPORTID_ROTATION_VECTOR:
-      qI = imu.getQuatI(); qJ = imu.getQuatJ();
-      qK = imu.getQuatK(); qW = imu.getQuatReal();
-      roll  = imu.getRoll()  * 180.0f / PI;
-      pitch = imu.getPitch() * 180.0f / PI;
-      yaw   = imu.getYaw()   * 180.0f / PI;
-      rvStatus = imu.getQuatAccuracy();
-      rvAcc    = imu.getQuatRadianAccuracy();
-      got |= 0b01; break;
-
-    /* The two rotation vectors share one layout in the report, so the same getters read both. */
-    case SENSOR_REPORTID_GAME_ROTATION_VECTOR:
-      gqI = imu.getQuatI(); gqJ = imu.getQuatJ();
-      gqK = imu.getQuatK(); gqW = imu.getQuatReal();
-      break;
-
-    case SENSOR_REPORTID_GYROSCOPE_CALIBRATED:
-      gx = imu.getGyroX(); gy = imu.getGyroY(); gz = imu.getGyroZ();
-      break;
-
-    case SENSOR_REPORTID_MAGNETIC_FIELD:
-      mx = imu.getMagX(); my = imu.getMagY(); mz = imu.getMagZ();
-      magStatus = imu.getMagAccuracy();
-      break;
-
-    case SENSOR_REPORTID_ACCELEROMETER:
-      ax = imu.getAccelX(); ay = imu.getAccelY(); az = imu.getAccelZ();
-      got |= 0b10; break;
-  }
+  sh2_service();                   // runs onSensorEvent for each event that has arrived
 
   if (got == 0b11) {
     got = 0;
